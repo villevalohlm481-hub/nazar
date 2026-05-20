@@ -1,9 +1,8 @@
 import re, time, base64, json, logging, sys, threading, aiohttp
 from datetime import datetime, timezone, timedelta, time as dtime
-from telegram import Update, InputFile
+from telegram import Update
 from telegram.error import Conflict, NetworkError
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from bs4 import BeautifulSoup
 import pytz
 
 # --- الإعدادات ومراقبة السيرفر ---
@@ -11,17 +10,13 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = "8372609971:AAGJXv7U60MDLScX87DF8LsTZx90_Ff3CPo"
-CHAT_ID = "8372609971"
+CHAT_ID = "8202101663"
 STATE_FILE = "nazar_state.json"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-    "Cache-Control": "no-cache, no-store, must-revalidate",
-    "Pragma": "no-cache",
-    "Expires": "0"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
 }
 
-# القواميس الحقيقية المحدثة للعبة RDO
 ID_MAP = {
     "der": ("Bluewater Marsh",   "Lemoyne"),
     "grz": ("Grizzlies East",    "Ambarino"),
@@ -54,7 +49,7 @@ FAST_TRAVEL_MAP = {
     "Beecher's Hope":    "Blackwater",
 }
 
-# ── نظام منع التكرار لطلب المستخدم (update_id) ──
+# ── نظام محكم لمنع تكرار الرسائل نهائياً ──
 _seen_updates = set()
 _seen_lock = threading.Lock()
 
@@ -63,11 +58,10 @@ def is_duplicate_update(update_id: int) -> bool:
         if update_id in _seen_updates:
             return True
         _seen_updates.add(update_id)
-        if len(_seen_updates) > 1000:
+        if len(_seen_updates) > 500:
             _seen_updates.clear()
     return False
 
-# ── نظام منع تكرار الإرسال التلقائي (Anti-Repeat State) ──
 def load_state():
     try:
         with open(STATE_FILE, "r") as f:
@@ -79,10 +73,12 @@ def save_state(date_str):
     with open(STATE_FILE, "w") as f:
         json.dump({"last_date": date_str}, f)
 
-# ── جلب البيانات والترقية لنظام Async (aiohttp) بدون كاش ──
+# ── جلب البيانات والصور فورياً من المصدر الأساسي المفتوح ──
 async def get_nazar():
-    location, region = None, None
+    location, region, img_url = None, None, None
     timestamp = int(time.time())
+    
+    # روابط الـ API الأصلية المفتوحة لخريطة jeanropke المحدثة ثانية بثانية
     sources = [
         ("api", f"https://api.github.com/repos/jeanropke/RDR2CollectorsMap/contents/data/nazar.json?t={timestamp}"),
         ("pages", f"https://jeanropke.github.io/RDR2CollectorsMap/data/nazar.json?t={timestamp}"),
@@ -95,7 +91,7 @@ async def get_nazar():
                 if name == "api":
                     req_headers["Accept"] = "application/vnd.github.v3+json"
                 
-                async with session.get(url, headers=req_headers, timeout=15) as resp:
+                async with session.get(url, headers=req_headers, timeout=10) as resp:
                     if resp.status != 200:
                         continue
                     
@@ -106,22 +102,11 @@ async def get_nazar():
                     
                     if loc_id in ID_MAP:
                         location, region = ID_MAP[loc_id]
+                        # سحب رابط الصورة الجغرافية للخريطة من الـ Repo المفتوح مباشرة بدون حماية وبأعلى دقة!
+                        img_url = f"https://jeanropke.github.io/RDR2CollectorsMap/assets/images/nazar/{loc_id}.png"
                         break
             except Exception as e:
                 logger.error(f"خطأ في جلب جين روبك [{name}]: {e}")
-
-        # جلب صورة اليوم من المصدر الصحيح madamnazar.io
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        img_url = None
-        try:
-            async with session.get(f"https://madamnazar.io/madam-nazar-location-{today}", timeout=10) as resp:
-                if resp.status == 200:
-                    soup = BeautifulSoup(await resp.text(), "html.parser")
-                    img_tag = soup.find("img")
-                    if img_tag and "src" in img_tag.attrs:
-                        img_url = img_tag["src"]
-        except Exception as e:
-            logger.error(f"خطأ في جلب صورة اليوم: {e}")
 
     return img_url, location, region
 
@@ -133,18 +118,19 @@ def get_countdown():
     total = int((nxt - now).total_seconds())
     return total // 3600, (total % 3600) // 60
 
-# ── الأوامر والردود التفاعلية ──
+# ── الأوامر والردود ──
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "˚˖𓍢ִ໋❀ يا هلا والله في بوت نزار المطور\n\n"
-        "📍 /nazar أو اكتب نزار — لموقع مدام نزار المحدث فورياً\n"
+        "📍 /nazar أو اكتب نزار — لموقع مدام نزار المحدث فورياً بالصور\n"
     )
 
 async def send_nazar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # إذا كان التحديث مكرراً نسحب عليه فوراً وما نرد
     if is_duplicate_update(update.update_id):
         return
 
-    msg = await update.message.reply_text("🔍 جاري الفحص وجلب الموقع المحدث الحين...")
+    msg = await update.message.reply_text("🔍 جاري فحص الموقع وجلب صورة الخريطة الحين...")
     img_url, location, region = await get_nazar()
 
     if not location:
@@ -163,22 +149,22 @@ async def send_nazar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await msg.delete()
 
+    # محاولة إرسال الصورة المباشرة من جين روبك
     if img_url:
         try:
             await update.message.reply_photo(photo=img_url, caption=caption, parse_mode="Markdown")
             return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"فشل إرسال الصورة: {e}")
 
+    # إذا تعطلت الصور تماماً يرسل النص النظيف كحماية
     await update.message.reply_text(caption, parse_mode="Markdown")
 
-# ── الإرسال التلقائي اليومي المنظم ──
 async def daily_auto_send(context: ContextTypes.DEFAULT_TYPE):
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     state = load_state()
     
     if state.get("last_date") == today_str:
-        logger.info("تم الإرسال التلقائي اليوم مسبقاً، تخطي التكرار.")
         return
 
     img_url, location, region = await get_nazar()
@@ -199,11 +185,10 @@ async def daily_auto_send(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=CHAT_ID, text=caption, parse_mode="Markdown")
         
         save_state(today_str)
-        logger.info(f"✅ تم الإرسال التلقائي اليومي بنجاح لتاريخ {today_str}")
+        logger.info(f"✅ تم الإرسال التلقائي اليومي لتاريخ {today_str}")
     except Exception as e:
         logger.error(f"فشل الإرسال التلقائي اليومي: {e}")
 
-# ── تشغيل البوت الأساسي المكتمل ──
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
@@ -211,11 +196,11 @@ def main():
     app.add_handler(CommandHandler("nazar", send_nazar))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"نزار"), send_nazar))
     
-    # جدولة الإرسال اليومي الساعة 6:01 UTC بانتظام وبدون تكرار
     app.job_queue.run_daily(daily_auto_send, time=dtime(6, 1, 0, tzinfo=pytz.UTC))
 
-    logger.info("🤖 Bot is completely running now...")
+    logger.info("🤖 Bot is completely running with anti-duplicate fix...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
+        
