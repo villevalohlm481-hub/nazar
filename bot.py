@@ -1,92 +1,221 @@
-import asyncio
-import logging
-import os
-import sys
-import aiohttp
+import re, time, base64, json, logging, sys, threading, aiohttp
+from datetime import datetime, timezone, timedelta, time as dtime
+from telegram import Update, InputFile
+from telegram.error import Conflict, NetworkError
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from bs4 import BeautifulSoup
 import pytz
-from datetime import datetime, timedelta, date
-from telegram import Update, InputMediaPhoto
-from telegram.ext import (
-    Application,
-    ContextTypes,
-    JobQueue,
-    CommandHandler,
-    Defaults,
-)
 
-# --- الإعدادات (Configuration) ---
-# يفضل وضع التوكن في متغيرات البيئة (Environment Variables) على الاستضافة
-TOKEN = os.getenv("8372609971:AAGJXv7U60MDLScX87DF8LsTZx90_Ff3CPo")  # ضع التوكن هنا مؤقتاً إن لم يكن موجوداً
-CHAT_ID = os.getenv("8372609971")  # معرف聊天室 الذي سيرسل إليه
-
-# تفعيل السجلات (Logging) لمتابعة الأخطاء
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+# --- الإعدادات ومراقبة السيرفر ---
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- قواعد البيانات (Maps) ---
-# تأكد من أن هذه القوائم كاملة كما طلبت. سأضع أمثلة توضيحية.
+TELEGRAM_TOKEN = "8372609971:AAGJXv7U60MDLScX87DF8LsTZx90_Ff3CPo"
+CHAT_ID = "8372609971"
+STATE_FILE = "nazar_state.json"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0"
+}
+
+# القواميس الحقيقية المحدثة للعبة RDO
 ID_MAP = {
-    # مثال: تحويل الـ ID الغير واضح إلى اسم_region واضح
-    "scarlett_meadows": "Scarlett Meadows",
-    "big_valley": "Big Valley",
-    "heartlands": "The Heartlands",
-    "cumberland_forest": "Cumberland Forest",
-    # أضف بقية المناطق هنا بالكامل...
+    "der": ("Bluewater Marsh",   "Lemoyne"),
+    "grz": ("Grizzlies East",    "Ambarino"),
+    "bbr": ("Black Balsam Rise", "Ambarino"),
+    "bgv": ("Big Valley",        "West Elizabeth"),
+    "blg": ("Scarlett Meadows",  "Lemoyne"),
+    "bwm": ("Bluewater Marsh",   "Lemoyne"),
+    "bch": ("Beecher's Hope",    "West Elizabeth"),
+    "twn": ("Twin Rocks",        "New Austin"),
+    "tmw": ("Tumbleweed",        "New Austin"),
+    "flt": ("Flatneck Station",  "New Hanover"),
+    "lmp": ("The Heartlands",    "New Hanover"),
+    "wnr": ("The Heartlands",    "New Hanover"),
+    "ann": ("Grizzlies East",    "Ambarino"),
+    "grw": ("Grizzlies East",    "Ambarino"),
 }
 
 FAST_TRAVEL_MAP = {
-    # مثال: ربط اسم المنطقة بأقرب نقطة Fast Travel
-    "Scarlett Meadows": "Emerald Ranch",
-    "Big Valley": "Strawberry",
-    "The Heartlands": "Heartland Overflow",
-    "Cumberland Forest": "Adlers Rest",
-    "Grizzlies East": "Wapiti",
-    # أضف بقية الخريطة هنا بالكامل...
+    "Grizzlies East":    "Annesburg",
+    "Black Balsam Rise": "Annesburg",
+    "Big Valley":        "Strawberry",
+    "Flatneck Station":  "Flatneck Station",
+    "The Heartlands":    "Emerald Ranch",
+    "Bluewater Marsh":   "Saint Denis",
+    "Great Plains":      "Blackwater",
+    "Scarlett Meadows":  "Rhodes",
+    "Tumbleweed":        "Tumbleweed",
+    "Hennigan's Stead":  "Armadillo",
+    "Twin Rocks":        "Armadillo",
+    "Beecher's Hope":    "Blackwater",
 }
 
-# متغيرات عامة لم，防止 التكرار (Anti-Repetition)
-last_sent_date = None
+# ── نظام منع التكرار لطلب المستخدم (update_id) ──
+_seen_updates = set()
+_seen_lock = threading.Lock()
 
-# --- Functions ---
+def is_duplicate_update(update_id: int) -> bool:
+    with _seen_lock:
+        if update_id in _seen_updates:
+            return True
+        _seen_updates.add(update_id)
+        if len(_seen_updates) > 1000:
+            _seen_updates.clear()
+    return False
 
-async def get_nazar_data():
-    """
-    جلب بيانات نزار اليوم من المصدر (API).
-    يستخدم aiohttp لجلب البيانات بشكل غير متزامن (Async).
-    """
+# ── نظام منع تكرار الإرسال التلقائي (Anti-Repeat State) ──
+def load_state():
     try:
-        #.source: usually RDR2Shifts API or Jeanropke Raw Data
-        url = "https://raw.githubusercontent.com/jeanropke/RDR2Map/master/data.json"
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    # البحث عن البيانات الحالية بناءً على التاريخ
-                    today_str = date.today().strftime("%Y-%m-%d")
-                    
-                    if today_str in data:
-                        info = data[today_str]
-                        return info
-                    else:
-                        logger.warning("لا توجد بيانات لهذا التاريخ في الـ API.")
-                        return None
-                else:
-                    logger.error(f"فشل جلب البيانات، كود الخطأ: {response.status}")
-                    return None
-    except Exception as e:
-        logger.error(f"Error fetching Nazar data: {e}")
-        return None
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"last_date": None}
 
-def get_map_image_url():
-    """
-    توليد رابط صورة الخريطة بناءً على تاريخ اليوم (Day of Year).
-    لأن madamnazar.io يستخدم هذا النمط: /map/2023/294.png
-    """
-    today = datetime.now()
-    #_year = today.year
-    #doy = today.timetuple
+def save_state(date_str):
+    with open(STATE_FILE, "w") as f:
+        json.dump({"last_date": date_str}, f)
+
+# ── جلب البيانات والترقية لنظام Async (aiohttp) بدون كاش ──
+async def get_nazar():
+    location, region = None, None
+    timestamp = int(time.time())
+    sources = [
+        ("api", f"https://api.github.com/repos/jeanropke/RDR2CollectorsMap/contents/data/nazar.json?t={timestamp}"),
+        ("pages", f"https://jeanropke.github.io/RDR2CollectorsMap/data/nazar.json?t={timestamp}"),
+    ]
+    
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        for name, url in sources:
+            try:
+                req_headers = {**HEADERS}
+                if name == "api":
+                    req_headers["Accept"] = "application/vnd.github.v3+json"
+                
+                async with session.get(url, headers=req_headers, timeout=15) as resp:
+                    if resp.status != 200:
+                        continue
+                    
+                    raw = (base64.b64decode((await resp.json())["content"]).decode() if name == "api" else await resp.text())
+                    data = json.loads(raw)
+                    first = data[0] if isinstance(data, list) else data
+                    loc_id = first.get("id", "").strip().lower()
+                    
+                    if loc_id in ID_MAP:
+                        location, region = ID_MAP[loc_id]
+                        break
+            except Exception as e:
+                logger.error(f"خطأ في جلب جين روبك [{name}]: {e}")
+
+        # جلب صورة اليوم من المصدر الصحيح madamnazar.io
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        img_url = None
+        try:
+            async with session.get(f"https://madamnazar.io/madam-nazar-location-{today}", timeout=10) as resp:
+                if resp.status == 200:
+                    soup = BeautifulSoup(await resp.text(), "html.parser")
+                    img_tag = soup.find("img")
+                    if img_tag and "src" in img_tag.attrs:
+                        img_url = img_tag["src"]
+        except Exception as e:
+            logger.error(f"خطأ في جلب صورة اليوم: {e}")
+
+    return img_url, location, region
+
+def get_countdown():
+    now = datetime.now(timezone.utc)
+    nxt = now.replace(hour=6, minute=0, second=0, microsecond=0)
+    if now >= nxt:
+        nxt += timedelta(days=1)
+    total = int((nxt - now).total_seconds())
+    return total // 3600, (total % 3600) // 60
+
+# ── الأوامر والردود التفاعلية ──
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "˚˖𓍢ִ໋❀ يا هلا والله في بوت نزار المطور\n\n"
+        "📍 /nazar أو اكتب نزار — لموقع مدام نزار المحدث فورياً\n"
+    )
+
+async def send_nazar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_duplicate_update(update.update_id):
+        return
+
+    msg = await update.message.reply_text("🔍 جاري الفحص وجلب الموقع المحدث الحين...")
+    img_url, location, region = await get_nazar()
+
+    if not location:
+        await msg.edit_text("❌ لم يتم تحديث الموقع من المصدر بعد، جربي مرة أخرى لاحقاً.")
+        return
+
+    hours, minutes = get_countdown()
+    fast = FAST_TRAVEL_MAP.get(location, "غير معروف")
+
+    caption = (
+        f"📍 موقع مدام نزار الحالي:\n"
+        f"← *{location}* ({region})\n\n"
+        f"🏇 أقرب فاست ترافل: *{fast}*\n"
+        f"⏳ تتغير نزار بعد: *{hours} ساعة و{minutes} دقيقة*"
+    )
+
+    await msg.delete()
+
+    if img_url:
+        try:
+            await update.message.reply_photo(photo=img_url, caption=caption, parse_mode="Markdown")
+            return
+        except Exception:
+            pass
+
+    await update.message.reply_text(caption, parse_mode="Markdown")
+
+# ── الإرسال التلقائي اليومي المنظم ──
+async def daily_auto_send(context: ContextTypes.DEFAULT_TYPE):
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    state = load_state()
+    
+    if state.get("last_date") == today_str:
+        logger.info("تم الإرسال التلقائي اليوم مسبقاً، تخطي التكرار.")
+        return
+
+    img_url, location, region = await get_nazar()
+    if not location:
+        return
+
+    fast = FAST_TRAVEL_MAP.get(location, "غير معروف")
+    caption = (
+        f"🔔 *تحديث يومي تلقائي لموقع مدام نزار*\n\n"
+        f"📍 الموقع: *{location}* ({region})\n"
+        f"🏇 أقرب فاست ترافل: *{fast}*"
+    )
+
+    try:
+        if img_url:
+            await context.bot.send_photo(chat_id=CHAT_ID, photo=img_url, caption=caption, parse_mode="Markdown")
+        else:
+            await context.bot.send_message(chat_id=CHAT_ID, text=caption, parse_mode="Markdown")
+        
+        save_state(today_str)
+        logger.info(f"✅ تم الإرسال التلقائي اليومي بنجاح لتاريخ {today_str}")
+    except Exception as e:
+        logger.error(f"فشل الإرسال التلقائي اليومي: {e}")
+
+# ── تشغيل البوت الأساسي المكتمل ──
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("nazar", send_nazar))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"نزار"), send_nazar))
+    
+    # جدولة الإرسال اليومي الساعة 6:01 UTC بانتظام وبدون تكرار
+    app.job_queue.run_daily(daily_auto_send, time=dtime(6, 1, 0, tzinfo=pytz.UTC))
+
+    logger.info("🤖 Bot is completely running now...")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
