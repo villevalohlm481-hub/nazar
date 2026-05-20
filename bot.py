@@ -9,7 +9,7 @@ import pytz
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = "8372609971:AAE80LAq2iTKqTVqPRglepIzAv21DNXNPB0"
+TELEGRAM_TOKEN = "8372609971:AAGJXv7U60MDLScX87DF8LsTZx90_Ff3CPo"
 CHAT_ID = "8202101663"
 COLLECTORS_MAP = "https://jeanropke.github.io/RDR2CollectorsMap/"
 
